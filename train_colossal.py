@@ -22,6 +22,14 @@ import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer
 
+import colossalai
+from colossalai.core import global_context as gpc
+from colossalai.builder import DataParallelBuilder, ZeroRedundancyOptimizerBuilder
+from colossalai.parallel_mode import ParallelMode
+
+from torch.utils.data import DataLoader
+from colossalai.utils import DistributedSampler
+
 import utils
 
 IGNORE_INDEX = -100
@@ -29,6 +37,28 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "</s>"
 DEFAULT_UNK_TOKEN = "</s>"
+
+
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+    
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=training_args.per_device_train_batch_size,
+        collate_fn=data_collator,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=4,
+    )
+
+    return dict(train_dataloader=train_dataloader, eval_dataset=None, data_collator=data_collator)
+
+
 PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
@@ -220,11 +250,45 @@ def train():
             }
         )
 
+    # replace with colossal ai and initialize colossal ai
+    model, optimizer, scheduler, tokenizer = colossalai.initialize(
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        tokenizer=tokenizer,
+        model_init_method=None,
+        config_path="config.yaml",
+        data_parallel_mode=ParallelMode.DATA,
+        pipeline_parallel_mode=ParallelMode.PIPELINE,
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+    )
+    
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-    trainer.train()
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    
+#     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+#     trainer.train()
+#     trainer.save_state()
+#     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    
+    engine = Engine(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        dataloader=data_module['train_dataloader'],
+        tokenizer=tokenizer,
+        config_path="path/to/colossalai/config.yaml",
+        num_steps=training_args.num_train_epochs * len(data_module['train_dataloader']),
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        log_interval=training_args.logging_steps,
+        eval_interval=training_args.eval_steps,
+        save_interval=training_args.save_steps,
+        save_dir=training_args.output_dir,
+        use_amp=True,
+    )
+    
+    engine.train()
+    engine.save_checkpoint()
 
 
 if __name__ == "__main__":
